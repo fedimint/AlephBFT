@@ -173,7 +173,9 @@ When it comes to availability, in this case `Data` is not a cryptographic finger
 
 ### 3.3 Guarantees of AlephBFT.
 
-Let `round_delay` be the average delay between two consecutive rounds in the Dag that can be configured in AlephBFT (default value: 0.5 sec). Under the assumption that there are at most `floor(N/3)` dishonest nodes in the committee and the network behaves reasonably well (we do not specify the details here, but roughly speaking, a weak form of partial synchrony is required) AlephBFT guarantees that:
+Let `round_delay` be the average delay between two consecutive rounds in the Dag that can be configured in AlephBFT (default value: 0.5 sec). Under the assumption that there are at most `floor(N/3)` dishonest nodes in the committee, at least `floor(2*N/3) + 1` honest, protocol-following nodes keep local unit creation enabled, and the network behaves reasonably well (we do not specify the details here, but roughly speaking, a weak form of partial synchrony is required) AlephBFT guarantees that:
+
+An online node whose gate remains closed does not count toward this creation threshold. It continues processing incoming units, but it cannot contribute the local units required for progress.
 
 1. Each honest node will make progress in producing to the `out` stream at a pace of roughly `1` ordered batch per `round_delay` seconds (by default, two batches per second).
 2. For honest nodes that are not "falling behind" significantly (because of network delays or other issues) it is guaranteed that the data items they input in the protocol (from their local `DataProvider` object) will have `FinalizationHandler::data_finalized` called on them with a delay of roughly `~round_delay*4` from the time of inputting it. It is hard to define what "falling behind" exactly means, but think of a situation where a node's round `r` unit is always arriving much later then the expected time for round `r` to start. When a node is falling behind from time to time, then there is no issue and its data will be still included in the output stream, however if this problem is chronic, then this node's data might not find its way into the output stream at all. If something like that happens, it most likely means that the `round_delay` is configured too aggresively and one should consider extending the delay.
@@ -205,3 +207,22 @@ There are essentially two ways to use AlephBFT:
 
 1. We feel that depending on the application there might be different ways to deal with sessions and its better if we leave the task of session managing to the user.
 2. In one of the future releases we plan to add an optional default session manager, but will still encourage the user to implement a custom one for a particular use-case.
+
+### 3.5 Pausing local unit creation
+
+Applications can install a dynamic gate in a session configuration:
+
+```rust
+let gate = UnitCreationGate::new();
+let config = config.with_unit_creation_gate(gate.clone());
+
+gate.close();
+// Local unit creation remains paused.
+gate.open();
+```
+
+Retain one clone to control the gate and pass the other through `Config`. Configurations that do not install a gate use the original creator path, without the gate's selection or cooperative-yield scheduling. Use a distinct gate for every concurrently live session; sharing one gate between live sessions is unsupported because it stores one creator task's waker.
+
+The creator checks the gate immediately before constructing each local `PreUnit`. While closed, it continues processing inbound parent and catch-up notifications and remains responsive to termination, but it does not acquire local data for, sign, back up, or broadcast a new unit. Opening the gate wakes the creator promptly, and its internal async wait is cancellation-safe.
+
+Closing does not acknowledge that the creator has reached the gate. A unit that passed the check concurrently with `close` may still complete, and this API does not provide a strict pause barrier.

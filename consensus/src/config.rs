@@ -1,4 +1,4 @@
-use crate::{NodeCount, NodeIndex, Round, SessionId};
+use crate::{NodeCount, NodeIndex, Round, SessionId, UnitCreationGate};
 use log::error;
 use std::{
     fmt::{Debug, Formatter},
@@ -74,6 +74,8 @@ pub struct Config {
     delay_config: DelayConfig,
     /// Maximum allowable round of a unit.
     max_round: Round,
+    /// Optional gate controlling whether this node may create a local unit.
+    unit_creation_gate: Option<UnitCreationGate>,
 }
 
 impl Config {
@@ -91,6 +93,20 @@ impl Config {
     }
     pub fn max_round(&self) -> Round {
         self.max_round
+    }
+
+    /// Enables dynamic gating of local unit creation.
+    ///
+    /// Retain a clone of `gate` to pause and resume local unit creation while
+    /// the session is running.
+    pub fn with_unit_creation_gate(mut self, gate: UnitCreationGate) -> Self {
+        self.unit_creation_gate = Some(gate);
+        self
+    }
+
+    /// Returns the optional gate controlling local unit creation.
+    pub(crate) fn unit_creation_gate(&self) -> Option<&UnitCreationGate> {
+        self.unit_creation_gate.as_ref()
     }
 }
 
@@ -138,6 +154,7 @@ pub fn create_config(
         n_members,
         delay_config,
         max_round,
+        unit_creation_gate: None,
     })
 }
 

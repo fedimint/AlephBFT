@@ -2,7 +2,7 @@ use crate::{
     config::{Config as GeneralConfig, DelaySchedule},
     runway::NotificationOut,
     units::{PreUnit, Unit},
-    Hasher, NodeCount, NodeIndex, Receiver, Round, Sender, Terminator,
+    Hasher, NodeCount, NodeIndex, Receiver, Round, Sender, Terminator, UnitCreationGate,
 };
 use futures::{
     channel::{
@@ -13,11 +13,22 @@ use futures::{
 };
 use futures_timer::Delay;
 use log::{debug, error, trace, warn};
-use std::fmt::{Debug, Formatter};
+use std::{
+    fmt::{Debug, Formatter},
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 mod creator;
 
 pub use creator::Creator;
+
+#[cfg(test)]
+thread_local! {
+    /// Number of gated helper entries on the current test thread.
+    static GATED_PATH_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The configuration needed for the process creating new units.
 #[derive(Clone)]
@@ -26,6 +37,7 @@ pub struct Config {
     n_members: NodeCount,
     create_lag: DelaySchedule,
     max_round: Round,
+    unit_creation_gate: Option<UnitCreationGate>,
 }
 
 impl Debug for Config {
@@ -45,6 +57,7 @@ impl From<GeneralConfig> for Config {
             n_members: conf.n_members(),
             create_lag: conf.delay_config().unit_creation_delay.clone(),
             max_round: conf.max_round(),
+            unit_creation_gate: conf.unit_creation_gate().cloned(),
         }
     }
 }
@@ -81,6 +94,84 @@ async fn create_unit<H: Hasher>(
     }
 }
 
+async fn create_unit_with_gate<H: Hasher>(
+    round: Round,
+    creator: &mut Creator<H>,
+    incoming_parents: &mut Receiver<Unit<H>>,
+    unit_creation_gate: &UnitCreationGate,
+) -> Result<(PreUnit<H>, Vec<H::Hash>), CreatorError> {
+    #[cfg(test)]
+    GATED_PATH_ENTRIES.set(GATED_PATH_ENTRIES.get() + 1);
+
+    loop {
+        wait_until_unit_creation_is_open(creator, incoming_parents, unit_creation_gate).await?;
+        match creator.create_unit(round) {
+            Ok(unit) => return Ok(unit),
+            Err(err) => {
+                trace!(target: "AlephBFT-creator", "Creator unable to create a new unit at round {}: {}.", round, err)
+            }
+        }
+        process_unit(creator, incoming_parents).await?;
+    }
+}
+
+/// Selects the original or gated creation path.
+///
+/// Keep these paths separate: even an open gate introduces a `select!` and can
+/// change the executor scheduling of configurations that did not opt in.
+async fn create_unit_for_config<H: Hasher>(
+    round: Round,
+    creator: &mut Creator<H>,
+    incoming_parents: &mut Receiver<Unit<H>>,
+    unit_creation_gate: Option<&UnitCreationGate>,
+) -> Result<(PreUnit<H>, Vec<H::Hash>), CreatorError> {
+    if let Some(gate) = unit_creation_gate {
+        create_unit_with_gate(round, creator, incoming_parents, gate).await
+    } else {
+        create_unit(round, creator, incoming_parents).await
+    }
+}
+
+async fn wait_until_unit_creation_is_open<H: Hasher>(
+    creator: &mut Creator<H>,
+    incoming_parents: &mut Receiver<Unit<H>>,
+    unit_creation_gate: &UnitCreationGate,
+) -> Result<(), CreatorError> {
+    loop {
+        futures::select! {
+            _ = unit_creation_gate.wait_until_open().fuse() => return Ok(()),
+            result = process_unit(creator, incoming_parents).fuse() => result?,
+        }
+        CooperativeYield::new().await;
+    }
+}
+
+/// A runtime-independent cooperative executor yield.
+struct CooperativeYield {
+    /// Whether this future has yielded once.
+    yielded: bool,
+}
+
+impl CooperativeYield {
+    fn new() -> Self {
+        Self { yielded: false }
+    }
+}
+
+impl Future for CooperativeYield {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.yielded {
+            Poll::Ready(())
+        } else {
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
 /// Tries to process a single parent from given `incoming_parents` receiver.
 /// Returns error when `incoming_parents` channel is closed.
 async fn process_unit<H: Hasher>(
@@ -104,6 +195,16 @@ async fn keep_processing_units<H: Hasher>(
     }
 }
 
+async fn keep_processing_units_with_gate<H: Hasher>(
+    creator: &mut Creator<H>,
+    incoming_parents: &mut Receiver<Unit<H>>,
+) -> anyhow::Result<(), CreatorError> {
+    loop {
+        process_unit(creator, incoming_parents).await?;
+        CooperativeYield::new().await;
+    }
+}
+
 async fn keep_processing_units_until<H: Hasher>(
     creator: &mut Creator<H>,
     incoming_parents: &mut Receiver<Unit<H>>,
@@ -118,6 +219,43 @@ async fn keep_processing_units_until<H: Hasher>(
         },
     }
     Ok(())
+}
+
+async fn keep_processing_units_until_with_gate<H: Hasher>(
+    creator: &mut Creator<H>,
+    incoming_parents: &mut Receiver<Unit<H>>,
+    until: Delay,
+) -> anyhow::Result<(), CreatorError> {
+    #[cfg(test)]
+    GATED_PATH_ENTRIES.set(GATED_PATH_ENTRIES.get() + 1);
+
+    futures::select! {
+        result = keep_processing_units_with_gate(creator, incoming_parents).fuse() => {
+            result?
+        },
+        _ = until.fuse() => {
+            debug!(target: "AlephBFT-creator", "Delay passed.");
+        },
+    }
+    Ok(())
+}
+
+/// Selects the original or gated delay path.
+///
+/// The gated version yields while draining ready parents so termination and
+/// gate-related work remain schedulable. The original path deliberately does
+/// not add that yield for configurations that did not opt in.
+async fn keep_processing_units_until_for_config<H: Hasher>(
+    creator: &mut Creator<H>,
+    incoming_parents: &mut Receiver<Unit<H>>,
+    until: Delay,
+    unit_creation_gate: Option<&UnitCreationGate>,
+) -> anyhow::Result<(), CreatorError> {
+    if unit_creation_gate.is_some() {
+        keep_processing_units_until_with_gate(creator, incoming_parents, until).await
+    } else {
+        keep_processing_units_until(creator, incoming_parents, until).await
+    }
 }
 
 /// A process responsible for creating new units. It receives all the units added locally to the Dag
@@ -189,6 +327,7 @@ async fn run_creator<H: Hasher>(
         n_members,
         create_lag,
         max_round,
+        unit_creation_gate,
     } = conf;
     let mut creator = Creator::new(node_id, n_members);
     let incoming_parents = &mut io.incoming_parents;
@@ -203,10 +342,22 @@ async fn run_creator<H: Hasher>(
         if !skip_delay {
             let lag = Delay::new(create_lag(round.into()));
 
-            keep_processing_units_until(&mut creator, incoming_parents, lag).await?;
+            keep_processing_units_until_for_config(
+                &mut creator,
+                incoming_parents,
+                lag,
+                unit_creation_gate.as_ref(),
+            )
+            .await?;
         }
 
-        let (unit, parent_hashes) = create_unit(round, &mut creator, incoming_parents).await?;
+        let (unit, parent_hashes) = create_unit_for_config(
+            round,
+            &mut creator,
+            incoming_parents,
+            unit_creation_gate.as_ref(),
+        )
+        .await?;
 
         trace!(target: "AlephBFT-creator", "Created a new unit {:?} at round {:?}.", unit, round);
 
@@ -216,3 +367,6 @@ async fn run_creator<H: Hasher>(
     warn!(target: "AlephBFT-creator", "Maximum round reached. Not creating another unit.");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

@@ -13,7 +13,9 @@ To explain the inner workings of AlephBFT it is instructive to follow the path o
 
 ### 5.1 Creator
 
-The creator produces units according to the AlephBFT protocol rules. It will wait until the prespecified delay has passed and attempt to create a unit using a maximal number of parents. If it is not possible yet, it will wait till the first moment enough parents are available. After creating the last unit, the creator stops producing new ones, although this is never expected to happen during correct execution.
+The creator produces units according to the AlephBFT protocol rules. It will wait until the prespecified delay has passed and attempt to create a unit using a maximal number of parents. If it is not possible yet, it will wait till the first moment enough parents are available. When a session is explicitly configured with a `UnitCreationGate`, the creator also waits for it immediately before constructing each `PreUnit`. Sessions without a gate use the original creator scheduling path. After creating the last configured round's unit, the creator stops producing new ones, although this is never expected to happen during correct execution.
+
+While the gate is closed, the creator continues processing parent notifications and remains responsive to termination, but it does not construct a new `PreUnit`. Consequently the local node does not acquire data for, sign, back up, or broadcast a new unit. Reopening wakes the creator. A gate stores one waiting task's waker, so every concurrently live session must use a distinct gate.
 
 Since the creator does not have access to the `DataIO` object and to the `Keychain` it is not able to create the unit "fully", for this reason it only chooses parents, the rest is filled by the `Runway`.
 

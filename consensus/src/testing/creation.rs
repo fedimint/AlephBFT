@@ -1,15 +1,16 @@
 use crate::{
-    creation::{run, IO},
+    creation::{run, Creator, IO},
     runway::NotificationOut as GenericNotificationOut,
     testing::{gen_config, gen_delay_config},
     units::{FullUnit as GenericFullUnit, PreUnit as GenericPreUnit, Unit as GenericUnit},
-    NodeCount, Receiver, Round, Sender, Terminator,
+    NodeCount, Receiver, Round, Sender, Terminator, UnitCreationGate,
 };
 use aleph_bft_mock::{Data, Hasher64};
 use futures::{
     channel::{mpsc, oneshot},
     FutureExt, StreamExt,
 };
+use std::{sync::Arc, time::Duration};
 
 type PreUnit = GenericPreUnit<Hasher64>;
 type Unit = GenericUnit<Hasher64>;
@@ -130,6 +131,108 @@ async fn finish(killers: Vec<oneshot::Sender<()>>, mut handles: Vec<tokio::task:
     for handle in handles.iter_mut() {
         handle.await.unwrap();
     }
+}
+
+fn spawn_gated_creator(
+    gate: UnitCreationGate,
+) -> (
+    Receiver<NotificationOut>,
+    Sender<Unit>,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (outgoing_units, units_from_creator) = mpsc::unbounded();
+    let (incoming_parents_tx, incoming_parents) = mpsc::unbounded();
+    let io = IO {
+        incoming_parents,
+        outgoing_units,
+    };
+    let mut delay_config = gen_delay_config();
+    delay_config.unit_creation_delay = Arc::new(|_| Duration::ZERO);
+    let config = gen_config(0.into(), NodeCount(1), delay_config).with_unit_creation_gate(gate);
+    let (starting_round_tx, starting_round_rx) = oneshot::channel();
+    let (exit_tx, exit_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        run(
+            config.into(),
+            io,
+            starting_round_rx,
+            Terminator::create_root(exit_rx, "AlephBFT-creator"),
+        )
+        .await;
+    });
+    starting_round_tx.send(Some(0)).unwrap();
+    (units_from_creator, incoming_parents_tx, exit_tx, handle)
+}
+
+fn continuously_send_parents(parents: Sender<Unit>) -> tokio::task::JoinHandle<()> {
+    let source = Creator::<Hasher64>::new(0.into(), NodeCount(1));
+    let (preunit, _) = source.create_unit(0).unwrap();
+    let unit = preunit_to_unit(preunit);
+    tokio::spawn(async move {
+        loop {
+            for _ in 0..4 {
+                parents.unbounded_send(unit.clone()).unwrap();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+}
+
+#[tokio::test]
+async fn closed_gate_stops_creation_and_reopening_resumes() {
+    let gate = UnitCreationGate::new();
+    gate.close();
+    let (mut units, parents, exit, handle) = spawn_gated_creator(gate.clone());
+    let parent_sender = continuously_send_parents(parents);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !gate.has_registered_waiter() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("creator should reach the closed gate");
+    assert!(
+        units.next().now_or_never().is_none(),
+        "a creator waiting at the closed gate should not emit a preunit"
+    );
+
+    gate.open();
+    let notification = tokio::time::timeout(Duration::from_secs(1), units.next())
+        .await
+        .expect("reopening should resume promptly")
+        .expect("creator output should remain open");
+    assert!(matches!(
+        notification,
+        NotificationOut::CreatedPreUnit(_, _)
+    ));
+    parent_sender.abort();
+
+    exit.send(()).unwrap();
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn termination_works_while_gate_is_closed() {
+    let gate = UnitCreationGate::new();
+    gate.close();
+    let (_units, parents, exit, handle) = spawn_gated_creator(gate.clone());
+    let parent_sender = continuously_send_parents(parents);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !gate.has_registered_waiter() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("creator should reach the closed gate");
+
+    exit.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("creator should terminate while gated")
+        .unwrap();
+    parent_sender.abort();
 }
 
 // This test checks if 7 creators that start at the same time will create 50 units each
